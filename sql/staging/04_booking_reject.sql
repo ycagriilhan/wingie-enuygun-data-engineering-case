@@ -18,8 +18,8 @@ WITH booking_base AS (
     END AS direction_type_from_flag,
     UPPER(TRIM(CAST(currency AS STRING))) AS currency,
     CAST(total AS FLOAT64) AS total,
-    CAST(created_at AS TIMESTAMP) AS created_at,
-    CAST(updated_at AS TIMESTAMP) AS updated_at,
+    TIMESTAMP_MICROS(CAST(CAST(created_at AS INT64) / 1000 AS INT64)) AS created_at,
+    TIMESTAMP_MICROS(CAST(CAST(updated_at AS INT64) / 1000 AS INT64)) AS updated_at,
     CAST(is_one_way AS INT64) AS is_one_way,
     CAST(status_code AS INT64) AS status_code,
     CASE

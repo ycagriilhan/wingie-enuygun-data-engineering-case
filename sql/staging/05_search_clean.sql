@@ -13,7 +13,7 @@ WITH search_base AS (
     CAST(request_id AS STRING) AS request_id,
     CAST(session_id AS STRING) AS session_id,
     CAST(user_id AS STRING) AS user_id,
-    CAST(created_at AS TIMESTAMP) AS created_at,
+    TIMESTAMP_MICROS(CAST(CAST(created_at AS INT64) / 1000 AS INT64)) AS created_at,
     CAST(passenger_types.adult AS INT64) AS passenger_adult,
     CAST(passenger_types.child AS INT64) AS passenger_child,
     CAST(passenger_types.infant AS INT64) AS passenger_infant,

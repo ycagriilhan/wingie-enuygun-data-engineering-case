@@ -8,6 +8,7 @@ __pycache__/
 
 # Local configuration
 .env
+.gcloud/
 
 # Generated pipeline outputs (kept out of git)
 data/landing/

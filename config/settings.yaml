@@ -13,6 +13,7 @@ cloud:
   bucket: ${GCS_BUCKET}
   project_id: ${GCP_PROJECT_ID}
   landing_prefix: ${GCS_LANDING_PREFIX}
+  bigquery_location: ${GCP_BQ_LOCATION}
   dataset_raw: ${GCP_DATASET_RAW}
   dataset_staging: ${GCP_DATASET_STAGING}
   dataset_mart: ${GCP_DATASET_MART}

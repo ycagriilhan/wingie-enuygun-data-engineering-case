@@ -33,6 +33,7 @@ class CloudConfig:
     bucket: str
     project_id: str
     landing_prefix: str
+    bigquery_location: str
     dataset_raw: str
     dataset_staging: str
     dataset_mart: str
@@ -138,6 +139,9 @@ def load_config(
         landing_prefix=_resolve_text(
             "GCS_LANDING_PREFIX", cloud_map.get("landing_prefix"), default="landing"
         ),
+        bigquery_location=_resolve_text(
+            "GCP_BQ_LOCATION", cloud_map.get("bigquery_location"), default="EU"
+        ),
         dataset_raw=_resolve_text("GCP_DATASET_RAW", cloud_map.get("dataset_raw"), default="raw"),
         dataset_staging=_resolve_text(
             "GCP_DATASET_STAGING", cloud_map.get("dataset_staging"), default="staging"
@@ -151,6 +155,12 @@ def load_config(
             missing.append("GCS_BUCKET")
         if not cloud.project_id:
             missing.append("GCP_PROJECT_ID")
+        if not cloud.dataset_raw:
+            missing.append("GCP_DATASET_RAW")
+        if not cloud.dataset_staging:
+            missing.append("GCP_DATASET_STAGING")
+        if not cloud.bigquery_location:
+            missing.append("GCP_BQ_LOCATION")
         if missing:
             raise ConfigError(
                 "Cloud mode requires non-empty values for: " + ", ".join(sorted(missing))

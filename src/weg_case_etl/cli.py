@@ -13,7 +13,7 @@ from weg_case_etl.pipeline import PipelineError, dq, extract_upload, load_raw, p
 app = typer.Typer(
     no_args_is_help=True,
     add_completion=False,
-    help="Wingie/Enuygun data engineering case CLI (Phase 1 scaffold).",
+    help="Wingie/Enuygun data engineering case CLI (Phase 3 raw + staging baseline).",
 )
 
 

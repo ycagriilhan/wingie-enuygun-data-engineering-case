@@ -1,6 +1,6 @@
 # Wingie / Enuygun Data Engineering Case
 
-Phase 1 + Phase 2 baseline for a local-first ETL workflow with a stable command contract.
+Phase 1 + Phase 2 + Phase 3 baseline for a local-first ETL workflow with a stable command contract.
 
 ## Data Contract
 
@@ -44,3 +44,15 @@ Options:
 - In `cloud` mode, `extract-upload` uploads landed files to:
   - `gs://<bucket>/<landing_prefix>/<run_id>/<dataset>/<file>`
 - `load-raw` now reads the extract manifest and maps classified files to `raw.*` target tables.
+
+## Phase 3 Behavior
+
+- `load-raw` is BigQuery-only in Phase 3 and performs real load jobs from `gcs_uri` values in extract manifest.
+- `transform` is BigQuery-only in Phase 3 and executes SQL scripts under `sql/staging/` to build:
+  - `provider_clean`
+  - `airport_reference_clean`
+  - `booking_clean`
+  - `booking_reject`
+  - `search_clean`
+  - `search_reject`
+- Invalid records are split into reject tables with explicit reason codes; clean tables keep valid latest records per grain.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copy2
@@ -10,6 +11,9 @@ import pyarrow.parquet as pq
 
 from weg_case_etl.config import AppConfig
 from weg_case_etl.contracts import COMMAND_ORDER, classify_source_file, required_source_paths
+
+
+PLACEHOLDER_PATTERN = re.compile(r"\{\{[A-Z_]+\}\}")
 
 
 class PipelineError(RuntimeError):
@@ -49,6 +53,10 @@ def _extract_manifest_path(config: AppConfig) -> Path:
     return config.paths.artifact_dir / "extract_upload_manifest.json"
 
 
+def _staging_sql_dir(config: AppConfig) -> Path:
+    return config.project_root / "sql" / "staging"
+
+
 def _validate_source_files(config: AppConfig) -> dict[str, Path]:
     source_map = required_source_paths(config.paths.source_dir)
     missing = [name for name, path in source_map.items() if not path.exists()]
@@ -58,6 +66,76 @@ def _validate_source_files(config: AppConfig) -> dict[str, Path]:
             f"Required source files not found in '{config.paths.source_dir}': {missing_list}"
         )
     return source_map
+
+
+def _require_bigquery_mode(config: AppConfig, command_name: str) -> None:
+    if config.run_mode != "cloud":
+        raise PipelineError(
+            f"'{command_name}' is BigQuery-only in Phase 3. Set run_mode to 'cloud' and provide GCP config."
+        )
+
+    missing = []
+    if not config.cloud.project_id:
+        missing.append("GCP_PROJECT_ID")
+    if not config.cloud.dataset_raw:
+        missing.append("GCP_DATASET_RAW")
+    if not config.cloud.dataset_staging:
+        missing.append("GCP_DATASET_STAGING")
+    if not config.cloud.bigquery_location:
+        missing.append("GCP_BQ_LOCATION")
+    if missing:
+        raise PipelineError(
+            "Missing required cloud configuration for BigQuery execution: " + ", ".join(sorted(missing))
+        )
+
+
+def _get_bigquery_client(config: AppConfig):
+    try:
+        from google.cloud import bigquery
+    except ImportError as exc:  # pragma: no cover - dependency path
+        raise PipelineError(
+            "BigQuery execution requires 'google-cloud-bigquery'. Install requirements first."
+        ) from exc
+
+    return bigquery, bigquery.Client(project=config.cloud.project_id)
+
+
+def _ensure_dataset(client, bigquery, dataset_fqn: str, location: str) -> None:
+    dataset = bigquery.Dataset(dataset_fqn)
+    dataset.location = location
+    client.create_dataset(dataset, exists_ok=True)
+
+
+def _table_fqn(config: AppConfig, dataset_name: str, table_name: str) -> str:
+    return f"{config.cloud.project_id}.{dataset_name}.{table_name}"
+
+
+def _render_sql_template(template: str, values: dict[str, str]) -> str:
+    rendered = template
+    for key, value in values.items():
+        rendered = rendered.replace(f"{{{{{key}}}}}", value)
+
+    unresolved = PLACEHOLDER_PATTERN.findall(rendered)
+    if unresolved:
+        raise PipelineError(f"Unresolved SQL placeholders: {sorted(set(unresolved))}")
+    return rendered
+
+
+def _load_staging_sql_files(config: AppConfig) -> list[Path]:
+    sql_dir = _staging_sql_dir(config)
+    if not sql_dir.exists():
+        raise PipelineError(f"Staging SQL directory not found: {sql_dir}")
+
+    sql_files = sorted(sql_dir.glob("*.sql"))
+    if not sql_files:
+        raise PipelineError(f"No staging SQL files found under: {sql_dir}")
+
+    return sql_files
+
+
+def _get_table_row_count(client, table_fqn: str) -> int:
+    table = client.get_table(table_fqn)
+    return int(table.num_rows)
 
 
 def _classify_and_land_files(config: AppConfig, run_identifier: str) -> list[dict[str, Any]]:
@@ -209,32 +287,66 @@ def extract_upload(config: AppConfig) -> dict[str, Any]:
 
 
 def load_raw(config: AppConfig) -> dict[str, Any]:
+    _require_bigquery_mode(config, "load-raw")
     extract_manifest = _read_json(_extract_manifest_path(config))
     landed_files = extract_manifest.get("landed_files", [])
     if not landed_files:
         raise PipelineError("No landed files found in extract-upload manifest. Run 'extract-upload' first.")
 
-    missing_landed = [row["landing_path"] for row in landed_files if not Path(row["landing_path"]).exists()]
-    if missing_landed:
+    missing_gcs = [row.get("file_name", "<unknown>") for row in landed_files if not row.get("gcs_uri")]
+    if missing_gcs:
         raise PipelineError(
-            "Landing files are missing. Re-run 'extract-upload'. Missing paths: "
-            + ", ".join(missing_landed)
+            "Extract manifest is missing gcs_uri values for: "
+            + ", ".join(sorted(missing_gcs))
+            + ". Run 'extract-upload' in cloud mode before 'load-raw'."
         )
 
     _ensure_dir(config.paths.raw_dir)
     _ensure_dir(config.paths.artifact_dir)
 
-    table_manifest = []
+    bigquery, client = _get_bigquery_client(config)
+    raw_dataset_fqn = f"{config.cloud.project_id}.{config.cloud.dataset_raw}"
+    _ensure_dataset(client, bigquery, raw_dataset_fqn, config.cloud.bigquery_location)
+
+    load_jobs: list[dict[str, Any]] = []
+    table_manifest: list[dict[str, Any]] = []
     for row in landed_files:
+        dataset_name = row["dataset"]
+        target_table = _table_fqn(config, config.cloud.dataset_raw, dataset_name)
+        gcs_uri = row["gcs_uri"]
+
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.PARQUET,
+            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+        load_job = client.load_table_from_uri(
+            gcs_uri,
+            target_table,
+            job_config=job_config,
+            location=config.cloud.bigquery_location,
+        )
+        load_job.result()
+        loaded_rows = _get_table_row_count(client, target_table)
+
+        load_jobs.append(
+            {
+                "file_name": row["file_name"],
+                "dataset": dataset_name,
+                "job_id": load_job.job_id,
+                "source_uri": gcs_uri,
+                "target_table": target_table,
+                "loaded_rows": loaded_rows,
+            }
+        )
         table_manifest.append(
             {
                 "source_file": row["file_name"],
-                "dataset": row["dataset"],
+                "dataset": dataset_name,
                 "domain": row["domain"],
-                "landing_path": row["landing_path"],
-                "gcs_uri": row.get("gcs_uri", ""),
-                "target_table": f"raw.{row['dataset']}",
-                "status": "ready_for_phase_3_raw_load",
+                "gcs_uri": gcs_uri,
+                "target_table": target_table,
+                "status": "loaded",
+                "loaded_rows": loaded_rows,
             }
         )
 
@@ -248,16 +360,10 @@ def load_raw(config: AppConfig) -> dict[str, Any]:
         "timestamp_utc": _utc_now(),
         "run_mode": config.run_mode,
         "run_id": extract_manifest.get("run_id"),
-        "tables": table_manifest,
-        "bigquery_load": (
-            {
-                "status": "pending_phase_3_implementation",
-                "project_id": config.cloud.project_id,
-                "dataset": config.cloud.dataset_raw,
-            }
-            if config.run_mode == "cloud"
-            else {"status": "not_applicable_in_local_mode"}
-        ),
+        "project_id": config.cloud.project_id,
+        "dataset_raw": config.cloud.dataset_raw,
+        "location": config.cloud.bigquery_location,
+        "load_jobs": load_jobs,
     }
     report_path = _write_json(config.paths.artifact_dir / "load_raw_report.json", report)
 
@@ -269,101 +375,129 @@ def load_raw(config: AppConfig) -> dict[str, Any]:
 
 
 def transform(config: AppConfig) -> dict[str, Any]:
+    _require_bigquery_mode(config, "transform")
     raw_manifest_path = config.paths.raw_dir / "raw_table_manifest.json"
-    if not raw_manifest_path.exists():
-        raise PipelineError(
-            f"Raw manifest not found at '{raw_manifest_path}'. Run 'load-raw' first."
-        )
+    raw_manifest = _read_json(raw_manifest_path)
+    raw_tables = raw_manifest.get("tables", [])
+    if not raw_tables:
+        raise PipelineError("Raw table manifest is empty. Run 'load-raw' first.")
 
-    _ensure_dir(config.paths.staging_dir)
-    _ensure_dir(config.paths.mart_dir)
     _ensure_dir(config.paths.artifact_dir)
 
-    staging_placeholder = config.paths.staging_dir / "phase1_staging_placeholder.json"
-    mart_placeholder = config.paths.mart_dir / "booking_enriched_placeholder.json"
-    _write_json(
-        staging_placeholder,
-        {
-            "layer": "staging",
-            "status": "stubbed_phase_1",
-            "generated_at_utc": _utc_now(),
-            "note": "Business transformations start in later phases.",
-        },
-    )
-    _write_json(
-        mart_placeholder,
-        {
-            "layer": "mart",
-            "table": "booking_enriched",
-            "status": "stubbed_phase_1",
-            "generated_at_utc": _utc_now(),
-            "note": "Business mart logic starts in later phases.",
-        },
-    )
+    bigquery, client = _get_bigquery_client(config)
+    staging_dataset_fqn = f"{config.cloud.project_id}.{config.cloud.dataset_staging}"
+    _ensure_dataset(client, bigquery, staging_dataset_fqn, config.cloud.bigquery_location)
+
+    sql_files = _load_staging_sql_files(config)
+    template_values = {
+        "PROJECT_ID": config.cloud.project_id,
+        "RAW_DATASET": config.cloud.dataset_raw,
+        "STAGING_DATASET": config.cloud.dataset_staging,
+    }
+
+    executed_steps: list[dict[str, Any]] = []
+    for sql_file in sql_files:
+        template = sql_file.read_text(encoding="utf-8")
+        rendered_sql = _render_sql_template(template, template_values)
+        query_job = client.query(rendered_sql, location=config.cloud.bigquery_location)
+        query_job.result()
+        executed_steps.append(
+            {
+                "sql_file": str(sql_file.relative_to(config.project_root)).replace("\\", "/"),
+                "job_id": query_job.job_id,
+                "statement_type": query_job.statement_type or "",
+            }
+        )
+
+    output_table_names = [
+        "provider_clean",
+        "airport_reference_clean",
+        "booking_clean",
+        "booking_reject",
+        "search_clean",
+        "search_reject",
+    ]
+    output_tables = []
+    for table_name in output_table_names:
+        fqn = _table_fqn(config, config.cloud.dataset_staging, table_name)
+        output_tables.append(
+            {
+                "table": fqn,
+                "row_count": _get_table_row_count(client, fqn),
+            }
+        )
 
     report = {
         "command": "transform",
         "timestamp_utc": _utc_now(),
-        "staging_output": str(staging_placeholder),
-        "mart_output": str(mart_placeholder),
+        "run_mode": config.run_mode,
+        "project_id": config.cloud.project_id,
+        "dataset_staging": config.cloud.dataset_staging,
+        "location": config.cloud.bigquery_location,
+        "executed_steps": executed_steps,
+        "output_tables": output_tables,
     }
     report_path = _write_json(config.paths.artifact_dir / "transform_report.json", report)
 
     return {
         "command": "transform",
         "report_path": str(report_path),
-        "outputs": [str(staging_placeholder), str(mart_placeholder)],
+        "output_table_count": len(output_tables),
     }
 
 
 def dq(config: AppConfig) -> dict[str, Any]:
     _validate_source_files(config)
     extract_manifest_path = _extract_manifest_path(config)
-    extract_manifest_exists = extract_manifest_path.exists()
-    landing_structure_status = "fail"
-
-    if extract_manifest_exists:
-        payload = _read_json(extract_manifest_path)
-        run_identifier = payload.get("run_id", "")
-        landing_files = payload.get("landed_files", [])
-        if run_identifier and landing_files:
-            landing_structure_status = (
-                "pass"
-                if all(f"/{run_identifier}/" in row.get("landing_relative_path", "") for row in landing_files)
-                else "fail"
-            )
+    load_raw_report_path = config.paths.artifact_dir / "load_raw_report.json"
+    transform_report_path = config.paths.artifact_dir / "transform_report.json"
 
     checks = [
         {
             "name": "extract_manifest_exists",
-            "status": "pass" if extract_manifest_exists else "fail",
+            "status": "pass" if extract_manifest_path.exists() else "fail",
             "message": "extract_upload_manifest.json must exist.",
         },
-        {
-            "name": "classified_landing_layout",
-            "status": landing_structure_status,
-            "message": "Landed files should include a run_id and dataset folder in landing path.",
-        },
-        {
-            "name": "raw_manifest_exists",
-            "status": "pass"
-            if (config.paths.raw_dir / "raw_table_manifest.json").exists()
-            else "fail",
-            "message": "raw_table_manifest.json must exist.",
-        },
-        {
-            "name": "transform_output_exists",
-            "status": "pass"
-            if (config.paths.mart_dir / "booking_enriched_placeholder.json").exists()
-            else "fail",
-            "message": "booking_enriched_placeholder.json must exist.",
-        },
+    ]
+
+    if config.run_mode == "cloud":
+        checks.extend(
+            [
+                {
+                    "name": "load_raw_report_exists",
+                    "status": "pass" if load_raw_report_path.exists() else "fail",
+                    "message": "load_raw_report.json must exist for BigQuery phase.",
+                },
+                {
+                    "name": "transform_report_exists",
+                    "status": "pass" if transform_report_path.exists() else "fail",
+                    "message": "transform_report.json must exist for BigQuery phase.",
+                },
+            ]
+        )
+    else:
+        checks.extend(
+            [
+                {
+                    "name": "load_raw_report_exists",
+                    "status": "pending",
+                    "message": "BigQuery checks are pending in local mode.",
+                },
+                {
+                    "name": "transform_report_exists",
+                    "status": "pending",
+                    "message": "BigQuery checks are pending in local mode.",
+                },
+            ]
+        )
+
+    checks.append(
         {
             "name": "mandatory_business_rules",
             "status": "pending",
-            "message": "Rule-level DQ implementation is planned for later phases.",
-        },
-    ]
+            "message": "Rule-level formal assertions are completed in Phase 4.",
+        }
+    )
 
     status = "pass" if all(check["status"] in {"pass", "pending"} for check in checks) else "fail"
     report = {

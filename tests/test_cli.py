@@ -28,6 +28,7 @@ def _write_config(tmp_path: Path, source_dir: Path) -> Path:
                 "cloud:",
                 "  bucket: ${GCS_BUCKET}",
                 "  project_id: ${GCP_PROJECT_ID}",
+                "  landing_prefix: ${GCS_LANDING_PREFIX}",
                 "  dataset_raw: ${GCP_DATASET_RAW}",
                 "  dataset_staging: ${GCP_DATASET_STAGING}",
                 "  dataset_mart: ${GCP_DATASET_MART}",
@@ -83,3 +84,38 @@ def test_run_all_executes_in_required_order(tmp_path: Path) -> None:
 
     assert payload["expected_order"] == ["profile", "extract-upload", "load-raw", "transform", "dq"]
     assert payload["executed_order"] == ["profile", "extract-upload", "load-raw", "transform", "dq"]
+
+    raw_manifest_path = tmp_path / "data" / "raw" / "raw_table_manifest.json"
+    raw_manifest = json.loads(raw_manifest_path.read_text(encoding="utf-8"))
+    target_tables = {row["target_table"] for row in raw_manifest["tables"]}
+    assert target_tables == {
+        "raw.airport_reference",
+        "raw.booking",
+        "raw.provider",
+        "raw.search",
+    }
+
+
+def test_extract_upload_writes_classified_landing_manifest(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir)
+
+    result = _run("extract-upload", config_path, repo_root)
+    assert result.exit_code == 0, result.output
+
+    manifest_path = tmp_path / "reports" / "artifacts" / "extract_upload_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    run_id = manifest["run_id"]
+    landed_files = manifest["landed_files"]
+    assert len(landed_files) == 4
+
+    dataset_names = {row["dataset"] for row in landed_files}
+    assert dataset_names == {"airport_reference", "booking", "provider", "search"}
+    assert manifest["cloud_upload"]["status"] == "not_applicable_in_local_mode"
+
+    for row in landed_files:
+        relative_path = row["landing_relative_path"]
+        assert run_id in relative_path
+        assert row["dataset"] in relative_path
+        assert row["file_size_bytes"] > 0

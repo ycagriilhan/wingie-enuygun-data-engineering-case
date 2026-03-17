@@ -9,7 +9,7 @@ from typing import Any, Callable
 import pyarrow.parquet as pq
 
 from weg_case_etl.config import AppConfig
-from weg_case_etl.contracts import COMMAND_ORDER, required_source_paths
+from weg_case_etl.contracts import COMMAND_ORDER, classify_source_file, required_source_paths
 
 
 class PipelineError(RuntimeError):
@@ -18,6 +18,10 @@ class PipelineError(RuntimeError):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
 def _ensure_dir(path: Path) -> None:
@@ -31,6 +35,20 @@ def _write_json(path: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        raise PipelineError(f"Required manifest not found: {path}")
+    with path.open("r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict):
+        raise PipelineError(f"Invalid JSON payload in manifest: {path}")
+    return payload
+
+
+def _extract_manifest_path(config: AppConfig) -> Path:
+    return config.paths.artifact_dir / "extract_upload_manifest.json"
+
+
 def _validate_source_files(config: AppConfig) -> dict[str, Path]:
     source_map = required_source_paths(config.paths.source_dir)
     missing = [name for name, path in source_map.items() if not path.exists()]
@@ -42,6 +60,83 @@ def _validate_source_files(config: AppConfig) -> dict[str, Path]:
     return source_map
 
 
+def _classify_and_land_files(config: AppConfig, run_identifier: str) -> list[dict[str, Any]]:
+    source_map = _validate_source_files(config)
+    _ensure_dir(config.paths.landing_dir)
+
+    landed_records: list[dict[str, Any]] = []
+    for file_name, source_path in source_map.items():
+        classification = classify_source_file(file_name)
+        dataset = classification["dataset"]
+        domain = classification["domain"]
+
+        dataset_landing_dir = config.paths.landing_dir / run_identifier / dataset
+        _ensure_dir(dataset_landing_dir)
+        landing_path = dataset_landing_dir / file_name
+        copy2(source_path, landing_path)
+
+        parquet_file = pq.ParquetFile(source_path)
+        landed_records.append(
+            {
+                "file_name": file_name,
+                "dataset": dataset,
+                "domain": domain,
+                "source_path": str(source_path),
+                "landing_path": str(landing_path),
+                "landing_relative_path": str(landing_path.relative_to(config.paths.landing_dir)).replace(
+                    "\\", "/"
+                ),
+                "row_count": parquet_file.metadata.num_rows,
+                "column_count": parquet_file.metadata.num_columns,
+                "columns": parquet_file.schema.names,
+                "file_size_bytes": source_path.stat().st_size,
+            }
+        )
+
+    return sorted(landed_records, key=lambda item: item["file_name"])
+
+
+def _upload_to_gcs(config: AppConfig, run_identifier: str, landed_files: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        from google.cloud import storage
+    except ImportError as exc:  # pragma: no cover - cloud path
+        raise PipelineError(
+            "Cloud mode requires 'google-cloud-storage'. Install it before running extract-upload."
+        ) from exc
+
+    prefix = (config.cloud.landing_prefix or "").strip("/")
+
+    try:
+        client = storage.Client(project=config.cloud.project_id)
+        bucket = client.bucket(config.cloud.bucket)
+
+        uploaded_objects: list[dict[str, str]] = []
+        for item in landed_files:
+            local_path = Path(item["landing_path"])
+            object_parts = [part for part in [prefix, run_identifier, item["dataset"], item["file_name"]] if part]
+            object_name = "/".join(object_parts)
+            blob = bucket.blob(object_name)
+            blob.upload_from_filename(str(local_path))
+            uploaded_objects.append(
+                {
+                    "file_name": item["file_name"],
+                    "object_name": object_name,
+                    "gcs_uri": f"gs://{config.cloud.bucket}/{object_name}",
+                }
+            )
+    except Exception as exc:  # pragma: no cover - cloud path
+        raise PipelineError(
+            f"GCS upload failed for bucket '{config.cloud.bucket}'. Check credentials and permissions."
+        ) from exc
+
+    return {
+        "status": "uploaded",
+        "bucket": config.cloud.bucket,
+        "prefix": prefix,
+        "uploaded_objects": uploaded_objects,
+    }
+
+
 def profile(config: AppConfig) -> dict[str, Any]:
     source_map = _validate_source_files(config)
     _ensure_dir(config.paths.artifact_dir)
@@ -49,9 +144,12 @@ def profile(config: AppConfig) -> dict[str, Any]:
     profile_rows = []
     for file_name, file_path in source_map.items():
         parquet_file = pq.ParquetFile(file_path)
+        classification = classify_source_file(file_name)
         profile_rows.append(
             {
                 "file_name": file_name,
+                "dataset": classification["dataset"],
+                "domain": classification["domain"],
                 "path": str(file_path),
                 "row_count": parquet_file.metadata.num_rows,
                 "column_count": parquet_file.metadata.num_columns,
@@ -76,70 +174,84 @@ def profile(config: AppConfig) -> dict[str, Any]:
 
 
 def extract_upload(config: AppConfig) -> dict[str, Any]:
-    source_map = _validate_source_files(config)
-    _ensure_dir(config.paths.landing_dir)
     _ensure_dir(config.paths.artifact_dir)
+    run_identifier = _run_id()
 
-    landed = []
-    for file_name, source_path in source_map.items():
-        destination = config.paths.landing_dir / file_name
-        copy2(source_path, destination)
-        landed.append({"file_name": file_name, "source": str(source_path), "landing": str(destination)})
+    landed_files = _classify_and_land_files(config, run_identifier)
+    cloud_upload: dict[str, Any]
+    if config.run_mode == "cloud":
+        cloud_upload = _upload_to_gcs(config, run_identifier, landed_files)
+        upload_index = {row["file_name"]: row["gcs_uri"] for row in cloud_upload["uploaded_objects"]}
+        for item in landed_files:
+            item["gcs_uri"] = upload_index.get(item["file_name"], "")
+    else:
+        cloud_upload = {"status": "not_applicable_in_local_mode"}
 
     manifest = {
         "command": "extract-upload",
         "timestamp_utc": _utc_now(),
         "run_mode": config.run_mode,
-        "landed_files": landed,
-        "cloud_upload": (
-            {
-                "status": "skipped_in_phase_1",
-                "bucket": config.cloud.bucket,
-            }
-            if config.run_mode == "cloud"
-            else {"status": "not_applicable_in_local_mode"}
-        ),
+        "run_id": run_identifier,
+        "source_dir": str(config.paths.source_dir),
+        "landing_root": str(config.paths.landing_dir),
+        "landed_files": landed_files,
+        "cloud_upload": cloud_upload,
     }
-    manifest_path = _write_json(config.paths.artifact_dir / "extract_upload_manifest.json", manifest)
+    manifest_path = _write_json(_extract_manifest_path(config), manifest)
 
     return {
         "command": "extract-upload",
         "manifest_path": str(manifest_path),
-        "landed_file_count": len(landed),
+        "run_id": run_identifier,
+        "landed_file_count": len(landed_files),
+        "cloud_status": cloud_upload["status"],
     }
 
 
 def load_raw(config: AppConfig) -> dict[str, Any]:
-    landing_map = required_source_paths(config.paths.landing_dir)
-    missing = [name for name, path in landing_map.items() if not path.exists()]
-    if missing:
+    extract_manifest = _read_json(_extract_manifest_path(config))
+    landed_files = extract_manifest.get("landed_files", [])
+    if not landed_files:
+        raise PipelineError("No landed files found in extract-upload manifest. Run 'extract-upload' first.")
+
+    missing_landed = [row["landing_path"] for row in landed_files if not Path(row["landing_path"]).exists()]
+    if missing_landed:
         raise PipelineError(
-            "Landing files are missing. Run 'extract-upload' first. Missing: "
-            + ", ".join(sorted(missing))
+            "Landing files are missing. Re-run 'extract-upload'. Missing paths: "
+            + ", ".join(missing_landed)
         )
 
     _ensure_dir(config.paths.raw_dir)
     _ensure_dir(config.paths.artifact_dir)
 
-    table_manifest = [
-        {
-            "source_file": file_name,
-            "landing_path": str(file_path),
-            "target_table": f"raw.{Path(file_name).stem}",
-            "status": "stubbed_phase_1",
-        }
-        for file_name, file_path in landing_map.items()
-    ]
-    _write_json(config.paths.raw_dir / "raw_table_manifest.json", {"tables": table_manifest})
+    table_manifest = []
+    for row in landed_files:
+        table_manifest.append(
+            {
+                "source_file": row["file_name"],
+                "dataset": row["dataset"],
+                "domain": row["domain"],
+                "landing_path": row["landing_path"],
+                "gcs_uri": row.get("gcs_uri", ""),
+                "target_table": f"raw.{row['dataset']}",
+                "status": "ready_for_phase_3_raw_load",
+            }
+        )
+
+    _write_json(
+        config.paths.raw_dir / "raw_table_manifest.json",
+        {"run_id": extract_manifest.get("run_id"), "tables": table_manifest},
+    )
 
     report = {
         "command": "load-raw",
         "timestamp_utc": _utc_now(),
         "run_mode": config.run_mode,
+        "run_id": extract_manifest.get("run_id"),
         "tables": table_manifest,
         "bigquery_load": (
             {
-                "status": "skipped_in_phase_1",
+                "status": "pending_phase_3_implementation",
                 "project_id": config.cloud.project_id,
                 "dataset": config.cloud.dataset_raw,
             }
@@ -206,14 +318,31 @@ def transform(config: AppConfig) -> dict[str, Any]:
 
 def dq(config: AppConfig) -> dict[str, Any]:
     _validate_source_files(config)
+    extract_manifest_path = _extract_manifest_path(config)
+    extract_manifest_exists = extract_manifest_path.exists()
+    landing_structure_status = "fail"
+
+    if extract_manifest_exists:
+        payload = _read_json(extract_manifest_path)
+        run_identifier = payload.get("run_id", "")
+        landing_files = payload.get("landed_files", [])
+        if run_identifier and landing_files:
+            landing_structure_status = (
+                "pass"
+                if all(f"/{run_identifier}/" in row.get("landing_relative_path", "") for row in landing_files)
+                else "fail"
+            )
 
     checks = [
         {
-            "name": "landing_manifest_exists",
-            "status": "pass"
-            if (config.paths.artifact_dir / "extract_upload_manifest.json").exists()
-            else "fail",
+            "name": "extract_manifest_exists",
+            "status": "pass" if extract_manifest_exists else "fail",
             "message": "extract_upload_manifest.json must exist.",
+        },
+        {
+            "name": "classified_landing_layout",
+            "status": landing_structure_status,
+            "message": "Landed files should include a run_id and dataset folder in landing path.",
         },
         {
             "name": "raw_manifest_exists",

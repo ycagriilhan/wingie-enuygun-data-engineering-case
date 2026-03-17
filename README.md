@@ -1,6 +1,6 @@
 # Wingie / Enuygun Data Engineering Case
 
-Phase 1 bootstrap for a local-first ETL workflow with a stable command contract.
+Phase 1 + Phase 2 baseline for a local-first ETL workflow with a stable command contract.
 
 ## Data Contract
 
@@ -36,3 +36,11 @@ Options:
 
 - `--config` (default: `config/settings.yaml`)
 - `--env-file` (default: `.env`)
+
+## Phase 2 Behavior
+
+- `extract-upload` classifies source files into dataset groups and lands them under:
+  - `data/landing/<run_id>/<dataset>/<file>`
+- In `cloud` mode, `extract-upload` uploads landed files to:
+  - `gs://<bucket>/<landing_prefix>/<run_id>/<dataset>/<file>`
+- `load-raw` now reads the extract manifest and maps classified files to `raw.*` target tables.

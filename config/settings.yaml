@@ -12,6 +12,7 @@ paths:
 cloud:
   bucket: ${GCS_BUCKET}
   project_id: ${GCP_PROJECT_ID}
+  landing_prefix: ${GCS_LANDING_PREFIX}
   dataset_raw: ${GCP_DATASET_RAW}
   dataset_staging: ${GCP_DATASET_STAGING}
   dataset_mart: ${GCP_DATASET_MART}

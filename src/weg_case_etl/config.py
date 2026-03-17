@@ -32,6 +32,7 @@ class PathConfig:
 class CloudConfig:
     bucket: str
     project_id: str
+    landing_prefix: str
     dataset_raw: str
     dataset_staging: str
     dataset_mart: str
@@ -134,6 +135,9 @@ def load_config(
     cloud = CloudConfig(
         bucket=_resolve_text("GCS_BUCKET", cloud_map.get("bucket"), default=""),
         project_id=_resolve_text("GCP_PROJECT_ID", cloud_map.get("project_id"), default=""),
+        landing_prefix=_resolve_text(
+            "GCS_LANDING_PREFIX", cloud_map.get("landing_prefix"), default="landing"
+        ),
         dataset_raw=_resolve_text("GCP_DATASET_RAW", cloud_map.get("dataset_raw"), default="raw"),
         dataset_staging=_resolve_text(
             "GCP_DATASET_STAGING", cloud_map.get("dataset_staging"), default="staging"

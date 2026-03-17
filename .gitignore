@@ -1,0 +1,27 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration
+.env
+
+# Generated pipeline outputs (kept out of git)
+data/landing/
+data/raw/
+data/staging/
+data/mart/
+reports/artifacts/
+artifacts/
+
+# Local database/cache artifacts
+*.db
+*.sqlite
+.cache/
+
+# OS noise
+.DS_Store
+Thumbs.db

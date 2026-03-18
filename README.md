@@ -247,6 +247,26 @@ How to read the project flow:
 
 Below are the screenshots added from `/images` for submission evidence.
 
+
+### SCHEMAS
+
+
+![Screenshot 17](images/ss17.png)
+
+
+![Screenshot 18](images/ss18.png)
+
+
+![Screenshot 19](images/ss19.png)
+
+
+![Screenshot 20](images/ss20.png)
+
+### EXAMPLE PREVIEW
+### 
+![Screenshot 16](images/ss16.png)
+
+### GENERAL 
 ### Screenshot 01
 ![Screenshot 01](images/ss1.png)
 
@@ -292,5 +312,4 @@ Below are the screenshots added from `/images` for submission evidence.
 ### Screenshot 15
 ![Screenshot 15](images/ss15.png)
 
-### Screenshot 16
-![Screenshot 16](images/ss16.png)
+

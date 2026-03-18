@@ -59,6 +59,18 @@ Phase 5 remains core tests/validation only.
 
 Core command contract remains unchanged.
 
+## Phase 7 - Optional MERGE/Upsert
+
+Phase 7 adds optional upsert behavior for `mart.booking_enriched` with feature flag control:
+
+- Flag off (`features.enable_merge_upsert=false` / `WEG_ENABLE_MERGE_UPSERT=false`):
+  - `transform` keeps existing mart SQL flow under `sql/mart/`
+- Flag on (`features.enable_merge_upsert=true` / `WEG_ENABLE_MERGE_UPSERT=true`):
+  - `transform` runs optional SQL under `sql/optional/`
+  - standard mart create/replace SQL is skipped
+  - upsert key is `booking_id`
+  - behavior is update + insert only (no delete of stale keys)
+
 ## Phase 2 Behavior
 
 - `extract-upload` classifies source files into dataset groups and lands them under:

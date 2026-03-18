@@ -61,6 +61,10 @@ def _mart_sql_dir(config: AppConfig) -> Path:
     return config.project_root / "sql" / "mart"
 
 
+def _optional_upsert_sql_dir(config: AppConfig) -> Path:
+    return config.optional_paths.sql_optional_dir
+
+
 def _validate_source_files(config: AppConfig) -> dict[str, Path]:
     source_map = required_source_paths(config.paths.source_dir)
     missing = [name for name, path in source_map.items() if not path.exists()]
@@ -140,6 +144,19 @@ def _load_staging_sql_files(config: AppConfig) -> list[Path]:
 
 def _load_mart_sql_files(config: AppConfig) -> list[Path]:
     return _load_sql_files(_mart_sql_dir(config), "mart")
+
+
+def _load_optional_upsert_sql_files(config: AppConfig) -> list[Path]:
+    return _load_sql_files(_optional_upsert_sql_dir(config), "optional upsert")
+
+
+def _resolve_transform_sql_plan(config: AppConfig) -> tuple[list[Path], list[Path], str]:
+    staging_sql_files = _load_staging_sql_files(config)
+    if config.features.enable_merge_upsert:
+        upsert_sql_files = _load_optional_upsert_sql_files(config)
+        return staging_sql_files, upsert_sql_files, "optional_upsert"
+    mart_sql_files = _load_mart_sql_files(config)
+    return staging_sql_files, mart_sql_files, "mart"
 
 
 def _load_sql_files(sql_dir: Path, layer_name: str) -> list[Path]:
@@ -410,8 +427,7 @@ def transform(config: AppConfig) -> dict[str, Any]:
     _ensure_dataset(client, bigquery, staging_dataset_fqn, config.cloud.bigquery_location)
     _ensure_dataset(client, bigquery, mart_dataset_fqn, config.cloud.bigquery_location)
 
-    staging_sql_files = _load_staging_sql_files(config)
-    mart_sql_files = _load_mart_sql_files(config)
+    staging_sql_files, final_sql_files, final_layer = _resolve_transform_sql_plan(config)
     template_values = {
         "PROJECT_ID": config.cloud.project_id,
         "RAW_DATASET": config.cloud.dataset_raw,
@@ -426,12 +442,12 @@ def transform(config: AppConfig) -> dict[str, Any]:
         template_values=template_values,
         layer="staging",
     )
-    mart_steps = _execute_sql_files(
+    final_steps = _execute_sql_files(
         client=client,
         config=config,
-        sql_files=mart_sql_files,
+        sql_files=final_sql_files,
         template_values=template_values,
-        layer="mart",
+        layer=final_layer,
     )
 
     staging_output_table_names = [
@@ -472,7 +488,7 @@ def transform(config: AppConfig) -> dict[str, Any]:
         "dataset_staging": config.cloud.dataset_staging,
         "dataset_mart": config.cloud.dataset_mart,
         "location": config.cloud.bigquery_location,
-        "executed_steps": [*staging_steps, *mart_steps],
+        "executed_steps": [*staging_steps, *final_steps],
         "output_tables": output_tables,
     }
     report_path = _write_json(config.paths.artifact_dir / "transform_report.json", report)

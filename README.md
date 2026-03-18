@@ -71,6 +71,24 @@ Phase 7 adds optional upsert behavior for `mart.booking_enriched` with feature f
   - upsert key is `booking_id`
   - behavior is update + insert only (no delete of stale keys)
 
+## Phase 8 - Optional Airflow DAG
+
+Phase 8 adds optional Airflow orchestration while keeping the core CLI command contract unchanged.
+
+- DAG artifact: `orchestration/airflow/dags/weg_case_optional_etl_dag.py`
+- DAG schedule: manual trigger only (`schedule=None`, `catchup=False`)
+- Task order mirrors pipeline command order exactly:
+  - `profile -> extract-upload -> load-raw -> transform -> dq`
+- Preflight guard task enforces:
+  - `features.enable_airflow=true` or `WEG_ENABLE_AIRFLOW=true`
+- CLI tasks run from repo root with explicit runtime files:
+  - `python cli.py <command> --config <path> --env-file <path>`
+- Optional runtime path overrides for Airflow DAG:
+  - `WEG_AIRFLOW_CONFIG_PATH` (default: `config/settings.yaml`)
+  - `WEG_AIRFLOW_ENV_FILE` (default: `.env`)
+
+Airflow dependency remains optional; core pipeline and test workflows do not require Airflow to be installed.
+
 ## Phase 2 Behavior
 
 - `extract-upload` classifies source files into dataset groups and lands them under:

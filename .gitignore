@@ -26,3 +26,5 @@ artifacts/
 # OS noise
 .DS_Store
 Thumbs.db
+docs/progress/final_interview_summary.md
+docs/progress/phase_09.md

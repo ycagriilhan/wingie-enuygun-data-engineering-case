@@ -7,7 +7,7 @@
 | 03 - Raw and Staging | `phase/03-raw-and-staging` | Completed | BigQuery raw load jobs and staging clean/reject SQL pipeline implemented. |
 | 04 - Mart and DQ | `phase/04-mart-and-dq` | Completed | Mart booking_enriched build and strict mandatory business-rule DQ checks implemented. |
 | 05 - Tests Validation | `phase/05-tests-validation` | Completed | Added validation evidence artifact and failure-aware run-all reporting with expanded test coverage; Phase 5 scope is core-only. |
-| 06 - Optional Foundation | `phase/06-optional-foundation` | Completed (Local) | Optional feature flags and reserved optional paths are implemented locally on the Phase 6 branch. |
+| 06 - Optional Foundation | `phase/06-optional-foundation` | Completed | Optional feature flags and reserved optional paths are implemented and documented under `docs/progress/phase_06.md`. |
 | 07 - Optional MERGE Upsert | `phase/07-optional-merge-upsert` | Completed | Added flag-controlled optional MERGE/Upsert for `mart.booking_enriched` keyed by `booking_id`, with update+insert semantics and no delete branch; cloud transform+dq validation passed with flag enabled. |
 | 08 - Optional Airflow DAG | `phase/08-optional-airflow-dag` | Completed | Added optional Airflow DAG with deterministic command-chain orchestration (`profile -> extract-upload -> load-raw -> transform -> dq`), manual trigger mode, and fail-fast `enable_airflow` guard. |
-| 09 - Docs Interview | `phase/09-docs-interview` | Pending | Final documentation and interview summary after optional phases complete. |
+| 09 - Docs Interview | `phase/09-docs-interview` | Completed | Completed requirement traceability audit, final documentation closure (`phase_09.md`), and interview handoff summary (`final_interview_summary.md`) with fresh cloud validation evidence from March 18, 2026. |

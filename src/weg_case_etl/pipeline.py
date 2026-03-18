@@ -57,6 +57,10 @@ def _staging_sql_dir(config: AppConfig) -> Path:
     return config.project_root / "sql" / "staging"
 
 
+def _mart_sql_dir(config: AppConfig) -> Path:
+    return config.project_root / "sql" / "mart"
+
+
 def _validate_source_files(config: AppConfig) -> dict[str, Path]:
     source_map = required_source_paths(config.paths.source_dir)
     missing = [name for name, path in source_map.items() if not path.exists()]
@@ -71,7 +75,7 @@ def _validate_source_files(config: AppConfig) -> dict[str, Path]:
 def _require_bigquery_mode(config: AppConfig, command_name: str) -> None:
     if config.run_mode != "cloud":
         raise PipelineError(
-            f"'{command_name}' is BigQuery-only in Phase 3. Set run_mode to 'cloud' and provide GCP config."
+            f"'{command_name}' requires BigQuery execution. Set run_mode to 'cloud' and provide GCP config."
         )
 
     missing = []
@@ -83,6 +87,8 @@ def _require_bigquery_mode(config: AppConfig, command_name: str) -> None:
         missing.append("GCP_DATASET_STAGING")
     if not config.cloud.bigquery_location:
         missing.append("GCP_BQ_LOCATION")
+    if command_name in {"transform", "dq"} and not config.cloud.dataset_mart:
+        missing.append("GCP_DATASET_MART")
     if missing:
         raise PipelineError(
             "Missing required cloud configuration for BigQuery execution: " + ", ".join(sorted(missing))
@@ -97,7 +103,14 @@ def _get_bigquery_client(config: AppConfig):
             "BigQuery execution requires 'google-cloud-bigquery'. Install requirements first."
         ) from exc
 
-    return bigquery, bigquery.Client(project=config.cloud.project_id)
+    try:
+        client = bigquery.Client(project=config.cloud.project_id)
+    except Exception as exc:
+        raise PipelineError(
+            "BigQuery client initialization failed. Configure Google Cloud credentials (ADC) and permissions."
+        ) from exc
+
+    return bigquery, client
 
 
 def _ensure_dataset(client, bigquery, dataset_fqn: str, location: str) -> None:
@@ -122,13 +135,20 @@ def _render_sql_template(template: str, values: dict[str, str]) -> str:
 
 
 def _load_staging_sql_files(config: AppConfig) -> list[Path]:
-    sql_dir = _staging_sql_dir(config)
+    return _load_sql_files(_staging_sql_dir(config), "staging")
+
+
+def _load_mart_sql_files(config: AppConfig) -> list[Path]:
+    return _load_sql_files(_mart_sql_dir(config), "mart")
+
+
+def _load_sql_files(sql_dir: Path, layer_name: str) -> list[Path]:
     if not sql_dir.exists():
-        raise PipelineError(f"Staging SQL directory not found: {sql_dir}")
+        raise PipelineError(f"{layer_name.title()} SQL directory not found: {sql_dir}")
 
     sql_files = sorted(sql_dir.glob("*.sql"))
     if not sql_files:
-        raise PipelineError(f"No staging SQL files found under: {sql_dir}")
+        raise PipelineError(f"No {layer_name} SQL files found under: {sql_dir}")
 
     return sql_files
 
@@ -386,30 +406,35 @@ def transform(config: AppConfig) -> dict[str, Any]:
 
     bigquery, client = _get_bigquery_client(config)
     staging_dataset_fqn = f"{config.cloud.project_id}.{config.cloud.dataset_staging}"
+    mart_dataset_fqn = f"{config.cloud.project_id}.{config.cloud.dataset_mart}"
     _ensure_dataset(client, bigquery, staging_dataset_fqn, config.cloud.bigquery_location)
+    _ensure_dataset(client, bigquery, mart_dataset_fqn, config.cloud.bigquery_location)
 
-    sql_files = _load_staging_sql_files(config)
+    staging_sql_files = _load_staging_sql_files(config)
+    mart_sql_files = _load_mart_sql_files(config)
     template_values = {
         "PROJECT_ID": config.cloud.project_id,
         "RAW_DATASET": config.cloud.dataset_raw,
         "STAGING_DATASET": config.cloud.dataset_staging,
+        "MART_DATASET": config.cloud.dataset_mart,
     }
 
-    executed_steps: list[dict[str, Any]] = []
-    for sql_file in sql_files:
-        template = sql_file.read_text(encoding="utf-8")
-        rendered_sql = _render_sql_template(template, template_values)
-        query_job = client.query(rendered_sql, location=config.cloud.bigquery_location)
-        query_job.result()
-        executed_steps.append(
-            {
-                "sql_file": str(sql_file.relative_to(config.project_root)).replace("\\", "/"),
-                "job_id": query_job.job_id,
-                "statement_type": query_job.statement_type or "",
-            }
-        )
+    staging_steps = _execute_sql_files(
+        client=client,
+        config=config,
+        sql_files=staging_sql_files,
+        template_values=template_values,
+        layer="staging",
+    )
+    mart_steps = _execute_sql_files(
+        client=client,
+        config=config,
+        sql_files=mart_sql_files,
+        template_values=template_values,
+        layer="mart",
+    )
 
-    output_table_names = [
+    staging_output_table_names = [
         "provider_clean",
         "airport_reference_clean",
         "booking_clean",
@@ -417,11 +442,23 @@ def transform(config: AppConfig) -> dict[str, Any]:
         "search_clean",
         "search_reject",
     ]
+    mart_output_table_names = ["booking_enriched"]
+
     output_tables = []
-    for table_name in output_table_names:
+    for table_name in staging_output_table_names:
         fqn = _table_fqn(config, config.cloud.dataset_staging, table_name)
         output_tables.append(
             {
+                "layer": "staging",
+                "table": fqn,
+                "row_count": _get_table_row_count(client, fqn),
+            }
+        )
+    for table_name in mart_output_table_names:
+        fqn = _table_fqn(config, config.cloud.dataset_mart, table_name)
+        output_tables.append(
+            {
+                "layer": "mart",
                 "table": fqn,
                 "row_count": _get_table_row_count(client, fqn),
             }
@@ -433,8 +470,9 @@ def transform(config: AppConfig) -> dict[str, Any]:
         "run_mode": config.run_mode,
         "project_id": config.cloud.project_id,
         "dataset_staging": config.cloud.dataset_staging,
+        "dataset_mart": config.cloud.dataset_mart,
         "location": config.cloud.bigquery_location,
-        "executed_steps": executed_steps,
+        "executed_steps": [*staging_steps, *mart_steps],
         "output_tables": output_tables,
     }
     report_path = _write_json(config.paths.artifact_dir / "transform_report.json", report)
@@ -446,8 +484,160 @@ def transform(config: AppConfig) -> dict[str, Any]:
     }
 
 
+def _execute_sql_files(
+    client,
+    config: AppConfig,
+    sql_files: list[Path],
+    template_values: dict[str, str],
+    layer: str,
+) -> list[dict[str, Any]]:
+    executed_steps: list[dict[str, Any]] = []
+    for sql_file in sql_files:
+        template = sql_file.read_text(encoding="utf-8")
+        rendered_sql = _render_sql_template(template, template_values)
+        query_job = client.query(rendered_sql, location=config.cloud.bigquery_location)
+        query_job.result()
+        executed_steps.append(
+            {
+                "layer": layer,
+                "sql_file": str(sql_file.relative_to(config.project_root)).replace("\\", "/"),
+                "job_id": query_job.job_id,
+                "statement_type": query_job.statement_type or "",
+            }
+        )
+    return executed_steps
+
+
+def _query_single_metric(client, sql: str, location: str) -> int:
+    query_job = client.query(sql, location=location)
+    rows = list(query_job.result())
+    if not rows:
+        raise PipelineError("DQ query returned no rows.")
+    row = rows[0]
+    metric_value: Any = None
+    if isinstance(row, dict):
+        metric_value = row.get("metric_value")
+    if metric_value is None:
+        try:
+            metric_value = row["metric_value"]
+        except Exception:
+            metric_value = row[0]
+    return int(metric_value or 0)
+
+
+def _evaluate_mandatory_business_rule_checks(config: AppConfig, client) -> list[dict[str, Any]]:
+    booking_clean = _table_fqn(config, config.cloud.dataset_staging, "booking_clean")
+    search_clean = _table_fqn(config, config.cloud.dataset_staging, "search_clean")
+    booking_enriched = _table_fqn(config, config.cloud.dataset_mart, "booking_enriched")
+
+    check_specs = [
+        {
+            "name": "booking_origin_destination_not_equal",
+            "message": "booking_clean must not contain origin = destination.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{booking_clean}` WHERE origin = destination",
+        },
+        {
+            "name": "search_origin_destination_not_equal",
+            "message": "search_clean must not contain origin = destination.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{search_clean}` WHERE origin = destination",
+        },
+        {
+            "name": "booking_direction_consistency",
+            "message": "booking_clean direction_type must match return_date nullability.",
+            "sql": (
+                "SELECT COUNT(1) AS metric_value "
+                f"FROM `{booking_clean}` "
+                "WHERE (return_date IS NULL AND direction_type != 'oneway') "
+                "OR (return_date IS NOT NULL AND direction_type != 'roundtrip')"
+            ),
+        },
+        {
+            "name": "search_direction_consistency",
+            "message": "search_clean direction_type must match return_date nullability.",
+            "sql": (
+                "SELECT COUNT(1) AS metric_value "
+                f"FROM `{search_clean}` "
+                "WHERE (return_date IS NULL AND direction_type != 'oneway') "
+                "OR (return_date IS NOT NULL AND direction_type != 'roundtrip')"
+            ),
+        },
+        {
+            "name": "booking_created_at_timestamp_compatibility",
+            "message": "booking_clean created_at must be populated as TIMESTAMP.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{booking_clean}` WHERE created_at IS NULL",
+        },
+        {
+            "name": "search_created_at_timestamp_compatibility",
+            "message": "search_clean created_at must be populated as TIMESTAMP.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{search_clean}` WHERE created_at IS NULL",
+        },
+        {
+            "name": "booking_negative_total_absent",
+            "message": "booking_clean must not contain negative total.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{booking_clean}` WHERE total < 0",
+        },
+        {
+            "name": "search_negative_price_absent",
+            "message": "search_clean must not contain negative cheapest_price.",
+            "sql": f"SELECT COUNT(1) AS metric_value FROM `{search_clean}` WHERE cheapest_price < 0",
+        },
+        {
+            "name": "booking_clean_duplicate_grain_zero",
+            "message": "booking_clean must be unique on booking_id.",
+            "sql": (
+                "SELECT COUNT(1) AS metric_value FROM ("
+                f"SELECT booking_id FROM `{booking_clean}` GROUP BY booking_id HAVING COUNT(1) > 1)"
+            ),
+        },
+        {
+            "name": "search_clean_duplicate_grain_zero",
+            "message": "search_clean must be unique on request_id.",
+            "sql": (
+                "SELECT COUNT(1) AS metric_value FROM ("
+                f"SELECT request_id FROM `{search_clean}` GROUP BY request_id HAVING COUNT(1) > 1)"
+            ),
+        },
+        {
+            "name": "mart_booking_enriched_duplicate_grain_zero",
+            "message": "mart.booking_enriched must be unique on booking_id.",
+            "sql": (
+                "SELECT COUNT(1) AS metric_value FROM ("
+                f"SELECT booking_id FROM `{booking_enriched}` GROUP BY booking_id HAVING COUNT(1) > 1)"
+            ),
+        },
+    ]
+
+    checks: list[dict[str, Any]] = []
+    for spec in check_specs:
+        try:
+            metric_value = _query_single_metric(client, spec["sql"], config.cloud.bigquery_location)
+            status = "pass" if metric_value == 0 else "fail"
+            checks.append(
+                {
+                    "name": spec["name"],
+                    "status": status,
+                    "message": spec["message"],
+                    "metric_value": metric_value,
+                    "expected_value": 0,
+                }
+            )
+        except Exception as exc:
+            checks.append(
+                {
+                    "name": spec["name"],
+                    "status": "fail",
+                    "message": f"{spec['message']} Query execution failed.",
+                    "metric_value": None,
+                    "expected_value": 0,
+                    "error": str(exc),
+                }
+            )
+    return checks
+
+
 def dq(config: AppConfig) -> dict[str, Any]:
     _validate_source_files(config)
+    _ensure_dir(config.paths.artifact_dir)
     extract_manifest_path = _extract_manifest_path(config)
     load_raw_report_path = config.paths.artifact_dir / "load_raw_report.json"
     transform_report_path = config.paths.artifact_dir / "transform_report.json"
@@ -457,24 +647,45 @@ def dq(config: AppConfig) -> dict[str, Any]:
             "name": "extract_manifest_exists",
             "status": "pass" if extract_manifest_path.exists() else "fail",
             "message": "extract_upload_manifest.json must exist.",
+            "metric_value": None,
+            "expected_value": None,
         },
     ]
 
     if config.run_mode == "cloud":
+        _require_bigquery_mode(config, "dq")
         checks.extend(
             [
                 {
                     "name": "load_raw_report_exists",
                     "status": "pass" if load_raw_report_path.exists() else "fail",
                     "message": "load_raw_report.json must exist for BigQuery phase.",
+                    "metric_value": None,
+                    "expected_value": None,
                 },
                 {
                     "name": "transform_report_exists",
                     "status": "pass" if transform_report_path.exists() else "fail",
                     "message": "transform_report.json must exist for BigQuery phase.",
+                    "metric_value": None,
+                    "expected_value": None,
                 },
             ]
         )
+
+        if all(check["status"] == "pass" for check in checks):
+            _, client = _get_bigquery_client(config)
+            checks.extend(_evaluate_mandatory_business_rule_checks(config, client))
+        else:
+            checks.append(
+                {
+                    "name": "mandatory_business_rules",
+                    "status": "fail",
+                    "message": "Mandatory business rule checks skipped because prerequisites are missing.",
+                    "metric_value": None,
+                    "expected_value": 0,
+                }
+            )
     else:
         checks.extend(
             [
@@ -482,24 +693,31 @@ def dq(config: AppConfig) -> dict[str, Any]:
                     "name": "load_raw_report_exists",
                     "status": "pending",
                     "message": "BigQuery checks are pending in local mode.",
+                    "metric_value": None,
+                    "expected_value": None,
                 },
                 {
                     "name": "transform_report_exists",
                     "status": "pending",
                     "message": "BigQuery checks are pending in local mode.",
+                    "metric_value": None,
+                    "expected_value": None,
+                },
+                {
+                    "name": "mandatory_business_rules",
+                    "status": "pending",
+                    "message": "Mandatory business rule checks run only in cloud mode (BigQuery).",
+                    "metric_value": None,
+                    "expected_value": 0,
                 },
             ]
         )
 
-    checks.append(
-        {
-            "name": "mandatory_business_rules",
-            "status": "pending",
-            "message": "Rule-level formal assertions are completed in Phase 4.",
-        }
-    )
+    if config.run_mode == "cloud":
+        status = "pass" if all(check["status"] == "pass" for check in checks) else "fail"
+    else:
+        status = "pass" if all(check["status"] in {"pass", "pending"} for check in checks) else "fail"
 
-    status = "pass" if all(check["status"] in {"pass", "pending"} for check in checks) else "fail"
     report = {
         "command": "dq",
         "timestamp_utc": _utc_now(),
@@ -508,11 +726,19 @@ def dq(config: AppConfig) -> dict[str, Any]:
     }
     report_path = _write_json(config.paths.artifact_dir / "dq_report.json", report)
 
-    return {
+    result = {
         "command": "dq",
         "overall_status": status,
         "report_path": str(report_path),
     }
+
+    if status == "fail":
+        failed_check_names = [check["name"] for check in checks if check["status"] == "fail"]
+        raise PipelineError(
+            "DQ checks failed: " + ", ".join(failed_check_names) + f". See report: {report_path}"
+        )
+
+    return result
 
 
 def run_all(config: AppConfig) -> dict[str, Any]:

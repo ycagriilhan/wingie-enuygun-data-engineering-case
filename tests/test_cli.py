@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from weg_case_etl.cli import app
+import weg_case_etl.pipeline as pipeline_module
 from weg_case_etl.pipeline import PipelineError, _render_sql_template
 
 
@@ -49,6 +50,21 @@ def _run(command: str, config_path: Path, repo_root: Path):
     )
 
 
+def _write_cloud_phase_reports(tmp_path: Path) -> Path:
+    artifact_dir = tmp_path / "reports" / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "extract_upload_manifest.json").write_text(
+        json.dumps({"command": "extract-upload"}, indent=2), encoding="utf-8"
+    )
+    (artifact_dir / "load_raw_report.json").write_text(
+        json.dumps({"command": "load-raw"}, indent=2), encoding="utf-8"
+    )
+    (artifact_dir / "transform_report.json").write_text(
+        json.dumps({"command": "transform"}, indent=2), encoding="utf-8"
+    )
+    return artifact_dir
+
+
 def test_profile_and_extract_upload_local_success(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source_dir = repo_root / "data" / "source"
@@ -74,7 +90,7 @@ def test_load_raw_fails_in_local_mode_with_clear_message(tmp_path: Path) -> None
     _run("extract-upload", config_path, repo_root)
     load_result = _run("load-raw", config_path, repo_root)
     assert load_result.exit_code == 1
-    assert "BigQuery-only in Phase 3" in load_result.output
+    assert "requires BigQuery execution" in load_result.output
 
 
 def test_transform_fails_in_local_mode_with_clear_message(tmp_path: Path) -> None:
@@ -84,7 +100,7 @@ def test_transform_fails_in_local_mode_with_clear_message(tmp_path: Path) -> Non
 
     transform_result = _run("transform", config_path, repo_root)
     assert transform_result.exit_code == 1
-    assert "BigQuery-only in Phase 3" in transform_result.output
+    assert "requires BigQuery execution" in transform_result.output
 
 
 def test_run_all_fails_in_local_mode_at_bigquery_step(tmp_path: Path) -> None:
@@ -94,7 +110,7 @@ def test_run_all_fails_in_local_mode_at_bigquery_step(tmp_path: Path) -> None:
 
     result = _run("run-all", config_path, repo_root)
     assert result.exit_code == 1
-    assert "BigQuery-only in Phase 3" in result.output
+    assert "requires BigQuery execution" in result.output
 
 
 def test_load_raw_requires_gcs_uri_in_cloud_mode(tmp_path: Path) -> None:
@@ -157,6 +173,106 @@ def test_sql_templates_include_dedup_and_reject_contracts() -> None:
     search_reject = files["06_search_reject.sql"]
     assert "duplicate_not_latest" in booking_reject
     assert "duplicate_not_latest" in search_reject
+
+
+def test_mart_sql_template_includes_required_joins() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    mart_sql_dir = repo_root / "sql" / "mart"
+    files = {path.name: path.read_text(encoding="utf-8") for path in mart_sql_dir.glob("*.sql")}
+
+    assert set(files) == {"01_booking_enriched.sql"}
+    booking_enriched = files["01_booking_enriched.sql"]
+    assert "{{PROJECT_ID}}" in booking_enriched
+    assert "{{STAGING_DATASET}}" in booking_enriched
+    assert "{{MART_DATASET}}" in booking_enriched
+    assert "booking_clean" in booking_enriched
+    assert "search_clean" in booking_enriched
+    assert "provider_clean" in booking_enriched
+    assert "airport_reference_clean" in booking_enriched
+    assert "b.request_id = s.request_id" in booking_enriched
+
+
+def test_dq_cloud_mode_passes_when_all_mandatory_checks_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+    _write_cloud_phase_reports(tmp_path)
+
+    monkeypatch.setattr(pipeline_module, "_get_bigquery_client", lambda config: (object(), object()))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_evaluate_mandatory_business_rule_checks",
+        lambda config, client: [
+            {
+                "name": "booking_origin_destination_not_equal",
+                "status": "pass",
+                "message": "ok",
+                "metric_value": 0,
+                "expected_value": 0,
+            }
+        ],
+    )
+
+    result = _run("dq", config_path, repo_root)
+    assert result.exit_code == 0, result.output
+
+    report_path = tmp_path / "reports" / "artifacts" / "dq_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["overall_status"] == "pass"
+
+
+def test_dq_cloud_mode_fails_when_mandatory_checks_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+    _write_cloud_phase_reports(tmp_path)
+
+    monkeypatch.setattr(pipeline_module, "_get_bigquery_client", lambda config: (object(), object()))
+    monkeypatch.setattr(
+        pipeline_module,
+        "_evaluate_mandatory_business_rule_checks",
+        lambda config, client: [
+            {
+                "name": "booking_negative_total_absent",
+                "status": "fail",
+                "message": "booking_clean must not contain negative total.",
+                "metric_value": 3,
+                "expected_value": 0,
+            }
+        ],
+    )
+
+    result = _run("dq", config_path, repo_root)
+    assert result.exit_code == 1
+    assert "DQ checks failed" in result.output
+
+    report_path = tmp_path / "reports" / "artifacts" / "dq_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["overall_status"] == "fail"
+
+
+def test_run_all_fails_when_dq_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+
+    monkeypatch.setattr(pipeline_module, "profile", lambda config: {"command": "profile"})
+    monkeypatch.setattr(pipeline_module, "extract_upload", lambda config: {"command": "extract-upload"})
+    monkeypatch.setattr(pipeline_module, "load_raw", lambda config: {"command": "load-raw"})
+    monkeypatch.setattr(pipeline_module, "transform", lambda config: {"command": "transform"})
+
+    def _failing_dq(config):
+        raise PipelineError("forced dq failure")
+
+    monkeypatch.setattr(pipeline_module, "dq", _failing_dq)
+
+    result = _run("run-all", config_path, repo_root)
+    assert result.exit_code == 1
+    assert "forced dq failure" in result.output
 
 
 def test_sql_template_renderer_replaces_all_placeholders() -> None:

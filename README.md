@@ -1,6 +1,6 @@
 # Wingie / Enuygun Data Engineering Case
 
-Phase 1 + Phase 2 + Phase 3 baseline for a local-first ETL workflow with a stable command contract.
+Phase 1 + Phase 2 + Phase 3 + Phase 4 baseline for a local-first ETL workflow with a stable command contract.
 
 ## Data Contract
 
@@ -56,3 +56,10 @@ Options:
   - `search_clean`
   - `search_reject`
 - Invalid records are split into reject tables with explicit reason codes; clean tables keep valid latest records per grain.
+
+## Phase 4 Behavior
+
+- `transform` is extended to execute `sql/mart/` after staging and build:
+  - `mart.booking_enriched`
+- `dq` in `cloud` mode executes mandatory business-rule checks against staging/mart outputs.
+- In `cloud` mode, `dq` fails the command (non-zero exit) when any mandatory rule check fails.

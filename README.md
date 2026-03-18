@@ -1,6 +1,6 @@
 # Wingie / Enuygun Data Engineering Case
 
-Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 baseline for a local-first ETL workflow with a stable command contract.
+Core baseline covers Phases 1-5 for a local-first ETL workflow with a stable command contract.
 
 ## Data Contract
 
@@ -36,6 +36,28 @@ Options:
 
 - `--config` (default: `config/settings.yaml`)
 - `--env-file` (default: `.env`)
+
+## Phase Roadmap (Current Numbering)
+
+- Phase 1-5: Core implementation (completed baseline)
+- Phase 6: Optional Foundation
+- Phase 7: Optional MERGE/Upsert
+- Phase 8: Optional Airflow DAG
+- Phase 9: Docs and Interview Prep
+
+## Phase 6 - Optional Foundation
+
+Phase 6 optional foundation is implemented as reserved interfaces only (no core behavior changes):
+Phase 5 remains core tests/validation only.
+
+- Feature flags in config/env (default disabled):
+  - `features.enable_merge_upsert` / `WEG_ENABLE_MERGE_UPSERT=false`
+  - `features.enable_airflow` / `WEG_ENABLE_AIRFLOW=false`
+- Reserved optional paths:
+  - `sql/optional/` for MERGE/Upsert SQL scripts
+  - `orchestration/airflow/dags/` for Airflow DAG files
+
+Core command contract remains unchanged.
 
 ## Phase 2 Behavior
 

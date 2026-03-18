@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 VALID_RUN_MODES = {"local", "cloud"}
+TRUE_VALUES = {"1", "true", "yes", "on"}
+FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 class ConfigError(ValueError):
@@ -40,11 +42,25 @@ class CloudConfig:
 
 
 @dataclass(frozen=True)
+class FeatureConfig:
+    enable_merge_upsert: bool
+    enable_airflow: bool
+
+
+@dataclass(frozen=True)
+class OptionalPathConfig:
+    sql_optional_dir: Path
+    airflow_dags_dir: Path
+
+
+@dataclass(frozen=True)
 class AppConfig:
     project_root: Path
     run_mode: str
     paths: PathConfig
     cloud: CloudConfig
+    features: FeatureConfig
+    optional_paths: OptionalPathConfig
     source_config_path: Path
 
 
@@ -82,6 +98,32 @@ def _resolve_text(
     if not allow_empty and not result:
         raise ConfigError(f"Config value for '{env_name}' cannot be empty.")
     return result
+
+
+def _resolve_bool(env_name: str, raw_value: Any, default: bool = False) -> bool:
+    env_value = os.getenv(env_name)
+    if env_value is not None:
+        candidate: Any = env_value
+    elif raw_value is None:
+        return default
+    else:
+        candidate = raw_value
+
+    if isinstance(candidate, bool):
+        return candidate
+    if isinstance(candidate, int):
+        return bool(candidate)
+
+    normalized = str(candidate).strip().lower()
+    if normalized in TRUE_VALUES:
+        return True
+    if normalized in FALSE_VALUES:
+        return False
+
+    raise ConfigError(
+        f"Config value for '{env_name}' must be boolean-like "
+        f"(one of {sorted(TRUE_VALUES | FALSE_VALUES)})."
+    )
 
 
 def load_config(
@@ -149,6 +191,38 @@ def load_config(
         dataset_mart=_resolve_text("GCP_DATASET_MART", cloud_map.get("dataset_mart"), default="mart"),
     )
 
+    features_map = _get_nested_map(raw_config, "features")
+    features = FeatureConfig(
+        enable_merge_upsert=_resolve_bool(
+            "WEG_ENABLE_MERGE_UPSERT",
+            features_map.get("enable_merge_upsert"),
+            default=False,
+        ),
+        enable_airflow=_resolve_bool(
+            "WEG_ENABLE_AIRFLOW",
+            features_map.get("enable_airflow"),
+            default=False,
+        ),
+    )
+
+    optional_paths_map = _get_nested_map(raw_config, "optional_paths")
+    optional_paths = OptionalPathConfig(
+        sql_optional_dir=_resolve_path(
+            os.getenv(
+                "WEG_SQL_OPTIONAL_DIR",
+                str(optional_paths_map.get("sql_optional_dir", "sql/optional")),
+            ),
+            project_root,
+        ),
+        airflow_dags_dir=_resolve_path(
+            os.getenv(
+                "WEG_AIRFLOW_DAGS_DIR",
+                str(optional_paths_map.get("airflow_dags_dir", "orchestration/airflow/dags")),
+            ),
+            project_root,
+        ),
+    )
+
     if run_mode == "cloud":
         missing = []
         if not cloud.bucket:
@@ -171,5 +245,7 @@ def load_config(
         run_mode=run_mode,
         paths=paths,
         cloud=cloud,
+        features=features,
+        optional_paths=optional_paths,
         source_config_path=config_path,
     )

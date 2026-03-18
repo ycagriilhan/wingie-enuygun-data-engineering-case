@@ -17,3 +17,11 @@ cloud:
   dataset_raw: ${GCP_DATASET_RAW}
   dataset_staging: ${GCP_DATASET_STAGING}
   dataset_mart: ${GCP_DATASET_MART}
+
+features:
+  enable_merge_upsert: false
+  enable_airflow: false
+
+optional_paths:
+  sql_optional_dir: sql/optional
+  airflow_dags_dir: orchestration/airflow/dags

@@ -1,6 +1,6 @@
 # Wingie / Enuygun Data Engineering Case
 
-Phase 1 + Phase 2 + Phase 3 + Phase 4 baseline for a local-first ETL workflow with a stable command contract.
+Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 baseline for a local-first ETL workflow with a stable command contract.
 
 ## Data Contract
 
@@ -63,3 +63,11 @@ Options:
   - `mart.booking_enriched`
 - `dq` in `cloud` mode executes mandatory business-rule checks against staging/mart outputs.
 - In `cloud` mode, `dq` fails the command (non-zero exit) when any mandatory rule check fails.
+
+## Phase 5 Behavior
+
+- `run-all` always writes `run_all_report.json`, including failure metadata (`overall_status`, `failed_step`, `error_message`).
+- `run-all` still exits non-zero when a stage fails.
+- A consolidated `validation_evidence_report.json` is generated to validate cross-artifact consistency.
+- Cloud-mode evidence checks include report existence, run_id consistency, step-count consistency, and `dq` pass state.
+- Local mode marks cloud-only evidence checks as `pending`.

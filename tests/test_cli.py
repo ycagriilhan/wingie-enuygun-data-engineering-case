@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from weg_case_etl.cli import app
+from weg_case_etl.config import load_config
 import weg_case_etl.pipeline as pipeline_module
 from weg_case_etl.pipeline import PipelineError, _render_sql_template
 
@@ -65,6 +66,113 @@ def _write_cloud_phase_reports(tmp_path: Path) -> Path:
     return artifact_dir
 
 
+def _write_json_payload(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def _parse_cli_json_payload(output: str) -> dict:
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith("{"):
+            return json.loads("\n".join(lines[index:]))
+    raise AssertionError(f"Could not find JSON payload in command output: {output!r}")
+
+
+def _write_validation_artifacts(
+    artifact_dir: Path,
+    *,
+    run_mode: str,
+    run_id: str = "20260101T000000Z",
+    load_raw_run_id: str | None = None,
+    dq_status: str = "pass",
+) -> None:
+    _write_json_payload(
+        artifact_dir / "profile_summary.json",
+        {
+            "command": "profile",
+            "run_mode": run_mode,
+        },
+    )
+    _write_json_payload(
+        artifact_dir / "extract_upload_manifest.json",
+        {
+            "command": "extract-upload",
+            "run_id": run_id,
+            "run_mode": run_mode,
+        },
+    )
+
+    executed_order = ["profile", "extract-upload"]
+    results = [
+        {
+            "step": "profile",
+            "result": {"command": "profile"},
+        },
+        {
+            "step": "extract-upload",
+            "result": {"command": "extract-upload", "run_id": run_id},
+        },
+    ]
+
+    if run_mode == "cloud":
+        load_raw_effective_run_id = load_raw_run_id or run_id
+        _write_json_payload(
+            artifact_dir / "load_raw_report.json",
+            {
+                "command": "load-raw",
+                "run_id": load_raw_effective_run_id,
+                "project_id": "test-project",
+                "load_jobs": [{"job_id": "job-1"}, {"job_id": "job-2"}],
+            },
+        )
+        _write_json_payload(
+            artifact_dir / "transform_report.json",
+            {
+                "command": "transform",
+                "project_id": "test-project",
+                "output_tables": [{"table": "t1"}, {"table": "t2"}],
+            },
+        )
+        _write_json_payload(
+            artifact_dir / "dq_report.json",
+            {
+                "command": "dq",
+                "overall_status": dq_status,
+            },
+        )
+        executed_order.extend(["load-raw", "transform", "dq"])
+        results.extend(
+            [
+                {
+                    "step": "load-raw",
+                    "result": {"command": "load-raw", "table_count": 2},
+                },
+                {
+                    "step": "transform",
+                    "result": {"command": "transform", "output_table_count": 2},
+                },
+                {
+                    "step": "dq",
+                    "result": {"command": "dq", "overall_status": dq_status},
+                },
+            ]
+        )
+
+    _write_json_payload(
+        artifact_dir / "run_all_report.json",
+        {
+            "command": "run-all",
+            "overall_status": "pass",
+            "failed_step": None,
+            "error_message": None,
+            "expected_order": ["profile", "extract-upload", "load-raw", "transform", "dq"],
+            "executed_order": executed_order,
+            "results": results,
+        },
+    )
+
+
 def test_profile_and_extract_upload_local_success(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[1]
     source_dir = repo_root / "data" / "source"
@@ -111,6 +219,17 @@ def test_run_all_fails_in_local_mode_at_bigquery_step(tmp_path: Path) -> None:
     result = _run("run-all", config_path, repo_root)
     assert result.exit_code == 1
     assert "requires BigQuery execution" in result.output
+
+    report_path = tmp_path / "reports" / "artifacts" / "run_all_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["overall_status"] == "fail"
+    assert report["failed_step"] == "load-raw"
+    assert "requires BigQuery execution" in report["error_message"]
+    assert report["executed_order"] == ["profile", "extract-upload"]
+
+    evidence_path = tmp_path / "reports" / "artifacts" / "validation_evidence_report.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["overall_status"] == "pending"
 
 
 def test_load_raw_requires_gcs_uri_in_cloud_mode(tmp_path: Path) -> None:
@@ -260,10 +379,37 @@ def test_run_all_fails_when_dq_fails(tmp_path: Path, monkeypatch: pytest.MonkeyP
     source_dir = repo_root / "data" / "source"
     config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
 
-    monkeypatch.setattr(pipeline_module, "profile", lambda config: {"command": "profile"})
-    monkeypatch.setattr(pipeline_module, "extract_upload", lambda config: {"command": "extract-upload"})
-    monkeypatch.setattr(pipeline_module, "load_raw", lambda config: {"command": "load-raw"})
-    monkeypatch.setattr(pipeline_module, "transform", lambda config: {"command": "transform"})
+    run_id = "20260101T000000Z"
+
+    def _profile(config):
+        _write_json_payload(config.paths.artifact_dir / "profile_summary.json", {"command": "profile"})
+        return {"command": "profile"}
+
+    def _extract(config):
+        _write_json_payload(
+            config.paths.artifact_dir / "extract_upload_manifest.json",
+            {"command": "extract-upload", "run_id": run_id},
+        )
+        return {"command": "extract-upload", "run_id": run_id}
+
+    def _load_raw(config):
+        _write_json_payload(
+            config.paths.artifact_dir / "load_raw_report.json",
+            {"command": "load-raw", "run_id": run_id, "load_jobs": [{"job_id": "job-1"}]},
+        )
+        return {"command": "load-raw", "table_count": 1}
+
+    def _transform(config):
+        _write_json_payload(
+            config.paths.artifact_dir / "transform_report.json",
+            {"command": "transform", "output_tables": [{"table": "t1"}]},
+        )
+        return {"command": "transform", "output_table_count": 1}
+
+    monkeypatch.setattr(pipeline_module, "profile", _profile)
+    monkeypatch.setattr(pipeline_module, "extract_upload", _extract)
+    monkeypatch.setattr(pipeline_module, "load_raw", _load_raw)
+    monkeypatch.setattr(pipeline_module, "transform", _transform)
 
     def _failing_dq(config):
         raise PipelineError("forced dq failure")
@@ -273,6 +419,143 @@ def test_run_all_fails_when_dq_fails(tmp_path: Path, monkeypatch: pytest.MonkeyP
     result = _run("run-all", config_path, repo_root)
     assert result.exit_code == 1
     assert "forced dq failure" in result.output
+
+    report_path = tmp_path / "reports" / "artifacts" / "run_all_report.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["overall_status"] == "fail"
+    assert report["failed_step"] == "dq"
+    assert report["executed_order"] == ["profile", "extract-upload", "load-raw", "transform"]
+
+    evidence_path = tmp_path / "reports" / "artifacts" / "validation_evidence_report.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["overall_status"] == "fail"
+
+
+def test_run_all_success_writes_validation_evidence_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+    run_id = "20260101T000000Z"
+
+    def _profile(config):
+        report_path = config.paths.artifact_dir / "profile_summary.json"
+        _write_json_payload(report_path, {"command": "profile"})
+        return {"command": "profile", "report_path": str(report_path)}
+
+    def _extract(config):
+        manifest_path = config.paths.artifact_dir / "extract_upload_manifest.json"
+        _write_json_payload(manifest_path, {"command": "extract-upload", "run_id": run_id})
+        return {
+            "command": "extract-upload",
+            "manifest_path": str(manifest_path),
+            "run_id": run_id,
+            "landed_file_count": 4,
+            "cloud_status": "uploaded",
+        }
+
+    def _load_raw(config):
+        report_path = config.paths.artifact_dir / "load_raw_report.json"
+        _write_json_payload(
+            report_path,
+            {
+                "command": "load-raw",
+                "run_id": run_id,
+                "project_id": "test-project",
+                "load_jobs": [{"job_id": "job-1"}, {"job_id": "job-2"}],
+            },
+        )
+        return {"command": "load-raw", "report_path": str(report_path), "table_count": 2}
+
+    def _transform(config):
+        report_path = config.paths.artifact_dir / "transform_report.json"
+        _write_json_payload(
+            report_path,
+            {
+                "command": "transform",
+                "project_id": "test-project",
+                "output_tables": [{"table": "t1"}, {"table": "t2"}],
+            },
+        )
+        return {"command": "transform", "report_path": str(report_path), "output_table_count": 2}
+
+    def _dq(config):
+        report_path = config.paths.artifact_dir / "dq_report.json"
+        _write_json_payload(report_path, {"command": "dq", "overall_status": "pass"})
+        return {"command": "dq", "overall_status": "pass", "report_path": str(report_path)}
+
+    monkeypatch.setattr(pipeline_module, "profile", _profile)
+    monkeypatch.setattr(pipeline_module, "extract_upload", _extract)
+    monkeypatch.setattr(pipeline_module, "load_raw", _load_raw)
+    monkeypatch.setattr(pipeline_module, "transform", _transform)
+    monkeypatch.setattr(pipeline_module, "dq", _dq)
+
+    result = _run("run-all", config_path, repo_root)
+    assert result.exit_code == 0, result.output
+
+    payload = _parse_cli_json_payload(result.output)
+    assert "validation_evidence_report_path" in payload
+
+    run_all_report_path = Path(payload["report_path"])
+    evidence_report_path = Path(payload["validation_evidence_report_path"])
+    assert run_all_report_path.exists()
+    assert evidence_report_path.exists()
+
+    run_all_report = json.loads(run_all_report_path.read_text(encoding="utf-8"))
+    assert run_all_report["overall_status"] == "pass"
+    assert run_all_report["failed_step"] is None
+    assert run_all_report["executed_order"] == ["profile", "extract-upload", "load-raw", "transform", "dq"]
+
+    evidence_report = json.loads(evidence_report_path.read_text(encoding="utf-8"))
+    assert evidence_report["overall_status"] == "pass"
+
+
+def test_validation_evidence_report_cloud_passes_with_consistent_artifacts(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+    config = load_config(config_path=config_path, env_path=repo_root / ".env.not.used")
+    _write_validation_artifacts(config.paths.artifact_dir, run_mode="cloud")
+
+    report = pipeline_module._build_validation_evidence_report(config)
+    assert report["overall_status"] == "pass"
+    assert report["summary"]["fail_count"] == 0
+    assert report["summary"]["pending_count"] == 0
+
+
+def test_validation_evidence_report_cloud_fails_on_run_id_mismatch(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="cloud")
+    config = load_config(config_path=config_path, env_path=repo_root / ".env.not.used")
+    _write_validation_artifacts(
+        config.paths.artifact_dir,
+        run_mode="cloud",
+        run_id="20260101T000000Z",
+        load_raw_run_id="20260101T000001Z",
+    )
+
+    report = pipeline_module._build_validation_evidence_report(config)
+    check_map = {check["name"]: check for check in report["checks"]}
+    assert report["overall_status"] == "fail"
+    assert check_map["run_id_consistency_across_reports"]["status"] == "fail"
+
+
+def test_validation_evidence_report_local_marks_cloud_checks_pending(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    source_dir = repo_root / "data" / "source"
+    config_path = _write_config(tmp_path, source_dir, run_mode="local")
+    config = load_config(config_path=config_path, env_path=repo_root / ".env.not.used")
+    _write_validation_artifacts(config.paths.artifact_dir, run_mode="local")
+
+    report = pipeline_module._build_validation_evidence_report(config)
+    check_map = {check["name"]: check for check in report["checks"]}
+    assert report["overall_status"] == "pending"
+    assert check_map["load_raw_report_exists"]["status"] == "pending"
+    assert check_map["transform_report_exists"]["status"] == "pending"
+    assert check_map["dq_report_exists"]["status"] == "pending"
+    assert check_map["run_all_step_order_consistency"]["status"] == "pass"
 
 
 def test_sql_template_renderer_replaces_all_placeholders() -> None:

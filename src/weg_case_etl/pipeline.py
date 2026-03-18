@@ -741,6 +741,403 @@ def dq(config: AppConfig) -> dict[str, Any]:
     return result
 
 
+def _artifact_report_paths(config: AppConfig) -> dict[str, Path]:
+    return {
+        "profile_summary": config.paths.artifact_dir / "profile_summary.json",
+        "extract_upload_manifest": _extract_manifest_path(config),
+        "load_raw_report": config.paths.artifact_dir / "load_raw_report.json",
+        "transform_report": config.paths.artifact_dir / "transform_report.json",
+        "dq_report": config.paths.artifact_dir / "dq_report.json",
+        "run_all_report": config.paths.artifact_dir / "run_all_report.json",
+    }
+
+
+def _read_optional_json_artifact(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "exists": False,
+            "is_valid_json": False,
+            "payload": None,
+            "error": None,
+        }
+
+    try:
+        payload = _read_json(path)
+        return {
+            "exists": True,
+            "is_valid_json": True,
+            "payload": payload,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "exists": True,
+            "is_valid_json": False,
+            "payload": None,
+            "error": str(exc),
+        }
+
+
+def _append_validation_check(
+    checks: list[dict[str, Any]],
+    *,
+    name: str,
+    status: str,
+    message: str,
+    metric_value: Any = None,
+    expected_value: Any = None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    check: dict[str, Any] = {
+        "name": name,
+        "status": status,
+        "message": message,
+        "metric_value": metric_value,
+        "expected_value": expected_value,
+    }
+    if details is not None:
+        check["details"] = details
+    checks.append(check)
+
+
+def _extract_run_all_step_result(run_all_payload: dict[str, Any], step_name: str) -> dict[str, Any] | None:
+    results = run_all_payload.get("results", [])
+    if not isinstance(results, list):
+        return None
+
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        if item.get("step") != step_name:
+            continue
+        step_result = item.get("result")
+        if isinstance(step_result, dict):
+            return step_result
+    return None
+
+
+def _build_validation_evidence_report(config: AppConfig) -> dict[str, Any]:
+    artifact_paths = _artifact_report_paths(config)
+    artifacts: dict[str, dict[str, Any]] = {}
+    payloads: dict[str, dict[str, Any]] = {}
+    for artifact_name, artifact_path in artifact_paths.items():
+        inspected = _read_optional_json_artifact(artifact_path)
+        artifacts[artifact_name] = {
+            "path": str(artifact_path),
+            "exists": inspected["exists"],
+            "is_valid_json": inspected["is_valid_json"],
+        }
+        if inspected["error"]:
+            artifacts[artifact_name]["error"] = inspected["error"]
+
+        payload = inspected["payload"]
+        if isinstance(payload, dict):
+            payloads[artifact_name] = payload
+
+    checks: list[dict[str, Any]] = []
+
+    always_required_specs = [
+        (
+            "profile_summary",
+            "profile_summary_exists",
+            "profile_summary.json must exist and be valid JSON.",
+        ),
+        (
+            "extract_upload_manifest",
+            "extract_upload_manifest_exists",
+            "extract_upload_manifest.json must exist and be valid JSON.",
+        ),
+        (
+            "run_all_report",
+            "run_all_report_exists",
+            "run_all_report.json must exist and be valid JSON.",
+        ),
+    ]
+    for artifact_name, check_name, message in always_required_specs:
+        is_ready = artifacts[artifact_name]["exists"] and artifacts[artifact_name]["is_valid_json"]
+        _append_validation_check(
+            checks,
+            name=check_name,
+            status="pass" if is_ready else "fail",
+            message=message,
+            details={"artifact": artifact_name, "path": artifacts[artifact_name]["path"]},
+        )
+
+    cloud_required_specs = [
+        (
+            "load_raw_report",
+            "load_raw_report_exists",
+            "load_raw_report.json must exist and be valid JSON for cloud validation.",
+        ),
+        (
+            "transform_report",
+            "transform_report_exists",
+            "transform_report.json must exist and be valid JSON for cloud validation.",
+        ),
+        (
+            "dq_report",
+            "dq_report_exists",
+            "dq_report.json must exist and be valid JSON for cloud validation.",
+        ),
+    ]
+    for artifact_name, check_name, message in cloud_required_specs:
+        if config.run_mode == "cloud":
+            is_ready = artifacts[artifact_name]["exists"] and artifacts[artifact_name]["is_valid_json"]
+            _append_validation_check(
+                checks,
+                name=check_name,
+                status="pass" if is_ready else "fail",
+                message=message,
+                details={"artifact": artifact_name, "path": artifacts[artifact_name]["path"]},
+            )
+        else:
+            _append_validation_check(
+                checks,
+                name=check_name,
+                status="pending",
+                message="Cloud validation artifact check is pending in local mode.",
+                details={"artifact": artifact_name, "path": artifacts[artifact_name]["path"]},
+            )
+
+    run_all_payload = payloads.get("run_all_report")
+    if run_all_payload is None:
+        _append_validation_check(
+            checks,
+            name="run_all_step_order_consistency",
+            status="fail",
+            message="Cannot validate run-all step ordering because run_all_report.json is unavailable.",
+        )
+    else:
+        executed_order = run_all_payload.get("executed_order")
+        results = run_all_payload.get("results")
+        if isinstance(executed_order, list) and isinstance(results, list):
+            result_steps = [item.get("step") for item in results if isinstance(item, dict)]
+            order_matches_results = executed_order == result_steps
+            expected_prefix = list(COMMAND_ORDER)[: len(executed_order)]
+            order_matches_prefix = executed_order == expected_prefix
+            is_consistent = order_matches_results and order_matches_prefix
+            _append_validation_check(
+                checks,
+                name="run_all_step_order_consistency",
+                status="pass" if is_consistent else "fail",
+                message="run_all_report executed_order must align with recorded results and command prefix order.",
+                metric_value=len(executed_order),
+                expected_value=len(result_steps),
+                details={
+                    "executed_order": executed_order,
+                    "result_steps": result_steps,
+                    "expected_prefix": expected_prefix,
+                },
+            )
+        else:
+            _append_validation_check(
+                checks,
+                name="run_all_step_order_consistency",
+                status="fail",
+                message="run_all_report must include list fields: executed_order and results.",
+            )
+
+    extract_payload = payloads.get("extract_upload_manifest")
+    load_raw_payload = payloads.get("load_raw_report")
+    transform_payload = payloads.get("transform_report")
+    dq_payload = payloads.get("dq_report")
+
+    if config.run_mode == "cloud":
+        if extract_payload and load_raw_payload and run_all_payload:
+            manifest_run_id = str(extract_payload.get("run_id") or "")
+            load_raw_run_id = str(load_raw_payload.get("run_id") or "")
+            run_all_extract_step = _extract_run_all_step_result(run_all_payload, "extract-upload")
+            run_all_extract_run_id = str((run_all_extract_step or {}).get("run_id") or "")
+
+            run_id_values = {
+                "extract_upload_manifest": manifest_run_id,
+                "load_raw_report": load_raw_run_id,
+                "run_all_extract_step": run_all_extract_run_id,
+            }
+            if all(run_id_values.values()):
+                is_consistent = len(set(run_id_values.values())) == 1
+                status = "pass" if is_consistent else "fail"
+                message = "run_id values must match across extract, load-raw, and run-all outputs."
+            else:
+                status = "fail"
+                message = "run_id is missing from one or more cloud artifacts."
+
+            _append_validation_check(
+                checks,
+                name="run_id_consistency_across_reports",
+                status=status,
+                message=message,
+                details=run_id_values,
+            )
+        else:
+            _append_validation_check(
+                checks,
+                name="run_id_consistency_across_reports",
+                status="fail",
+                message="Cannot validate run_id consistency because one or more cloud artifacts are unavailable.",
+            )
+    else:
+        _append_validation_check(
+            checks,
+            name="run_id_consistency_across_reports",
+            status="pending",
+            message="run_id consistency is validated only in cloud mode.",
+        )
+
+    if config.run_mode == "cloud":
+        if load_raw_payload and run_all_payload:
+            load_jobs = load_raw_payload.get("load_jobs")
+            load_raw_step = _extract_run_all_step_result(run_all_payload, "load-raw")
+            reported_table_count = (load_raw_step or {}).get("table_count")
+
+            if isinstance(load_jobs, list) and isinstance(reported_table_count, int):
+                is_consistent = len(load_jobs) == reported_table_count
+                _append_validation_check(
+                    checks,
+                    name="load_raw_step_count_consistency",
+                    status="pass" if is_consistent else "fail",
+                    message="load-raw table_count must match load_raw_report load_jobs length.",
+                    metric_value=len(load_jobs),
+                    expected_value=reported_table_count,
+                )
+            else:
+                _append_validation_check(
+                    checks,
+                    name="load_raw_step_count_consistency",
+                    status="fail",
+                    message="Cannot validate load-raw count consistency due to missing fields.",
+                )
+        else:
+            _append_validation_check(
+                checks,
+                name="load_raw_step_count_consistency",
+                status="fail",
+                message="Cannot validate load-raw count consistency because required artifacts are unavailable.",
+            )
+    else:
+        _append_validation_check(
+            checks,
+            name="load_raw_step_count_consistency",
+            status="pending",
+            message="load-raw count consistency is validated only in cloud mode.",
+        )
+
+    if config.run_mode == "cloud":
+        if transform_payload and run_all_payload:
+            output_tables = transform_payload.get("output_tables")
+            transform_step = _extract_run_all_step_result(run_all_payload, "transform")
+            reported_output_table_count = (transform_step or {}).get("output_table_count")
+
+            if isinstance(output_tables, list) and isinstance(reported_output_table_count, int):
+                is_consistent = len(output_tables) == reported_output_table_count
+                _append_validation_check(
+                    checks,
+                    name="transform_step_count_consistency",
+                    status="pass" if is_consistent else "fail",
+                    message="transform output_table_count must match transform_report output_tables length.",
+                    metric_value=len(output_tables),
+                    expected_value=reported_output_table_count,
+                )
+            else:
+                _append_validation_check(
+                    checks,
+                    name="transform_step_count_consistency",
+                    status="fail",
+                    message="Cannot validate transform count consistency due to missing fields.",
+                )
+        else:
+            _append_validation_check(
+                checks,
+                name="transform_step_count_consistency",
+                status="fail",
+                message="Cannot validate transform count consistency because required artifacts are unavailable.",
+            )
+    else:
+        _append_validation_check(
+            checks,
+            name="transform_step_count_consistency",
+            status="pending",
+            message="transform count consistency is validated only in cloud mode.",
+        )
+
+    if config.run_mode == "cloud":
+        if dq_payload:
+            dq_status = dq_payload.get("overall_status")
+            _append_validation_check(
+                checks,
+                name="dq_overall_status_pass",
+                status="pass" if dq_status == "pass" else "fail",
+                message="dq_report overall_status must be 'pass' for cloud validation success.",
+                metric_value=dq_status,
+                expected_value="pass",
+            )
+        else:
+            _append_validation_check(
+                checks,
+                name="dq_overall_status_pass",
+                status="fail",
+                message="Cannot validate DQ status because dq_report.json is unavailable.",
+            )
+    else:
+        _append_validation_check(
+            checks,
+            name="dq_overall_status_pass",
+            status="pending",
+            message="DQ pass/fail validation is evaluated only in cloud mode.",
+        )
+
+    pass_count = sum(1 for check in checks if check["status"] == "pass")
+    fail_count = sum(1 for check in checks if check["status"] == "fail")
+    pending_count = sum(1 for check in checks if check["status"] == "pending")
+
+    if fail_count > 0:
+        overall_status = "fail"
+    elif pending_count > 0:
+        overall_status = "pending"
+    else:
+        overall_status = "pass"
+
+    run_id = None
+    if extract_payload is not None:
+        run_id = extract_payload.get("run_id")
+
+    project_id = ""
+    for payload_name in ("load_raw_report", "transform_report"):
+        payload = payloads.get(payload_name)
+        if payload is None:
+            continue
+        value = payload.get("project_id")
+        if value:
+            project_id = str(value)
+            break
+
+    return {
+        "command": "validation-evidence",
+        "timestamp_utc": _utc_now(),
+        "run_mode": config.run_mode,
+        "overall_status": overall_status,
+        "summary": {
+            "total_checks": len(checks),
+            "pass_count": pass_count,
+            "fail_count": fail_count,
+            "pending_count": pending_count,
+        },
+        "run_metadata": {
+            "run_id": run_id,
+            "project_id": project_id,
+            "expected_command_order": list(COMMAND_ORDER),
+        },
+        "artifacts": artifacts,
+        "checks": checks,
+    }
+
+
+def _write_validation_evidence_report(config: AppConfig) -> Path:
+    report = _build_validation_evidence_report(config)
+    report_path = config.paths.artifact_dir / "validation_evidence_report.json"
+    return _write_json(report_path, report)
+
+
 def run_all(config: AppConfig) -> dict[str, Any]:
     _ensure_dir(config.paths.artifact_dir)
 
@@ -753,21 +1150,42 @@ def run_all(config: AppConfig) -> dict[str, Any]:
     ]
 
     step_results: list[dict[str, Any]] = []
+    failed_step: str | None = None
+    error_message: str | None = None
+    step_error: Exception | None = None
     for step_name, step_function in steps:
-        result = step_function(config)
-        step_results.append({"step": step_name, "result": result})
+        try:
+            result = step_function(config)
+            step_results.append({"step": step_name, "result": result})
+        except Exception as exc:
+            failed_step = step_name
+            error_message = str(exc)
+            step_error = exc
+            break
+
+    overall_status = "pass" if failed_step is None else "fail"
 
     report = {
         "command": "run-all",
         "timestamp_utc": _utc_now(),
+        "overall_status": overall_status,
+        "failed_step": failed_step,
+        "error_message": error_message,
         "expected_order": list(COMMAND_ORDER),
         "executed_order": [item["step"] for item in step_results],
         "results": step_results,
     }
     report_path = _write_json(config.paths.artifact_dir / "run_all_report.json", report)
+    validation_evidence_report_path = _write_validation_evidence_report(config)
+
+    if step_error is not None:
+        raise PipelineError(
+            f"run-all failed at '{failed_step}': {error_message}. See report: {report_path}"
+        ) from step_error
 
     return {
         "command": "run-all",
         "report_path": str(report_path),
         "executed_steps": [item["step"] for item in step_results],
+        "validation_evidence_report_path": str(validation_evidence_report_path),
     }

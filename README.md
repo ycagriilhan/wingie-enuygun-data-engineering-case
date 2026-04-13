@@ -1,4 +1,4 @@
-﻿# Wingie / Enuygun Data Engineering Case
+﻿
 
 ## 1) Executive Summary
 
